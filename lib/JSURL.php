@@ -21,17 +21,29 @@ class JSURL {
     ];
 
     public static function stringify($v) {
+        // Mirrors the JS implementation: ASCII word chars, "-" and "." pass through;
+        // "$" becomes "!"; everything else is escaped per UTF-16 code unit
+        // (*xx for < 0x100, **xxxx otherwise). The /u flag makes the regex match
+        // whole UTF-8 characters instead of individual bytes.
         $encode = function ($s) {
-            if(preg_match('/[^\w\-\.]/', $s)){
-                return preg_replace_callback('/[^\w\-\.]/', function ($matches) {
-                    $ch = $matches[0];
-                    if ($ch === '$') return '!';
-                    $ch = mb_ord($ch, 'UTF-8');
-                    return $ch < 0x100 ? '*' . str_pad(dechex($ch), 2, '0', STR_PAD_LEFT) : '**' . str_pad(dechex($ch), 4, '0', STR_PAD_LEFT);
-                }, $s);
-            }else{
+            $s = (string)$s;
+            if (!preg_match('/[^A-Za-z0-9_\-\.]/u', $s)) {
                 return $s;
             }
+            return preg_replace_callback('/[^A-Za-z0-9_\-\.]/u', function ($matches) {
+                $ch = $matches[0];
+                if ($ch === '$') return '!';
+                $cp = mb_ord($ch, 'UTF-8');
+                if ($cp < 0x100) {
+                    return '*' . str_pad(dechex($cp), 2, '0', STR_PAD_LEFT);
+                }
+                if ($cp > 0xFFFF) {
+                    // JS strings are UTF-16, so astral characters become a surrogate pair
+                    $cp -= 0x10000;
+                    return '**' . dechex(0xD800 + ($cp >> 10)) . '**' . dechex(0xDC00 + ($cp & 0x3FF));
+                }
+                return '**' . str_pad(dechex($cp), 4, '0', STR_PAD_LEFT);
+            }, $s);
         };
 
         if (is_numeric($v) && !is_string($v)) { // WSG/mrg patch to match js, may cause a few extra apos
@@ -81,12 +93,20 @@ class JSURL {
         while (self::$i < self::$len && ($ch=self::$s[self::$i]) !== '~' && $ch !== ')') {
             if ($ch === '*') {
                 if ($beg < self::$i) $r .= substr(self::$s, $beg, self::$i - $beg);
-                if (self::$s[self::$i+1] === '*') {
-                    $r .= chr(hexdec(substr(self::$s, self::$i + 2, 4)));
+                if ((self::$s[self::$i+1] ?? '') === '*') {
+                    $cp = hexdec(substr(self::$s, self::$i + 2, 4));
                     self::$i += 6;
+                    // Recombine a UTF-16 surrogate pair (**d83d**de00) into one code point
+                    if ($cp >= 0xD800 && $cp <= 0xDBFF
+                        && preg_match('/^\*\*([dD][c-fC-F][0-9a-fA-F]{2})/', substr(self::$s, self::$i, 6), $m)) {
+                        $cp = 0x10000 + (($cp - 0xD800) << 10) + (hexdec($m[1]) - 0xDC00);
+                        self::$i += 6;
+                    }
+                    // lone surrogates can't be represented in UTF-8
+                    $r .= ($cp >= 0xD800 && $cp <= 0xDFFF) ? "\u{FFFD}" : mb_chr($cp, 'UTF-8');
                 } else {
-                    $r .= chr(hexdec(substr(self::$s, self::$i+1, 2)));
-                     self::$i += 3;
+                    $r .= mb_chr(hexdec(substr(self::$s, self::$i+1, 2)), 'UTF-8');
+                    self::$i += 3;
                 }
                 $beg = self::$i;
             } elseif ($ch === '!') {
